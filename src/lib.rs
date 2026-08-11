@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use numpy::PyArray3;
+use numpy::{PyArray3, IntoPyArray, ndarray::Array3};
 use std::path::Path;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -53,7 +53,7 @@ impl VideoInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "VideoInfo(dur={:.1f}s, {}x{} @{:.2f}fps, {})",
+            "VideoInfo(dur={:.1}s, {}x{} @{:.2}fps, {})",
             self.duration, self.width, self.height, self.fps, self.codec
         )
     }
@@ -87,7 +87,6 @@ impl VideoFrameReader {
     /// Lompat ke detik tertentu → kembalikan bingkai
     fn seek_and_read(&mut self, second: f64) -> PyResult<Py<PyArray3<u8>>> {
         use std::process::Command;
-        use std::io::Cursor;
 
         let output = Command::new("ffmpeg")
             .args(&[
@@ -118,8 +117,15 @@ impl VideoFrameReader {
             ));
         }
 
+        let arr = Array3::from_shape_vec(
+            (self.height as usize, self.width as usize, 3),
+            data[0..expected_len].to_vec(),
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Shape gagal: {}", e)))?;
+
         Python::with_gil(|py| {
-            Ok(PyArray3::from_vec(py, data[0..expected_len].to_vec(), [self.height as usize, self.width as usize, 3]).into())
+            let py_arr: Py<PyArray3<u8>> = arr.into_pyarray(py).into();
+            Ok(py_arr)
         })
     }
 }
@@ -152,7 +158,7 @@ fn baca_mp4_info(file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
             b"mvhd" => {
                 let mut v = [0u8; 1];
                 file.read_exact(&mut v)?;
-                let version = v[0];
+                let _version = v[0];
                 file.seek(SeekFrom::Current(12))?; // lewati waktu pembuatan dll
                 let mut ts_buf = [0u8; 4];
                 file.read_exact(&mut ts_buf)?;
@@ -200,7 +206,6 @@ fn baca_mkv_info(_file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
 
 fn baca_ffprobe_dinamis(path: &str) -> PyResult<(f64, u32, u32, f64, String)> {
     use std::process::Command;
-    use std::io::Read;
 
     let output = Command::new("ffprobe")
         .args(&[
