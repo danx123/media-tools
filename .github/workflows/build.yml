@@ -1,0 +1,36 @@
+name: Build Media Tools
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Kompilasi media_tools
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pasang Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Pasang Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Pasang Maturin
+        run: pip install maturin
+
+      - name: 🔨 Kompilasi
+        run: maturin build --release --out dist
+
+      - name: 📋 Lihat Hasil
+        run: dir dist/
+
+      - name: 📤 Unggah Artefak
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-tools-windows
+          path: dist/*.whl
