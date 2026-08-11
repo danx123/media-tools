@@ -21,25 +21,38 @@ struct VideoInfo {
 #[pymethods]
 impl VideoInfo {
     #[new]
-    fn new(file_path: &str) -> PyResult<Self> {
-        let path = Path::new(file_path);
-        let mut file = File::open(path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
+    fn new(py: Python<'_>, file_path: &str) -> PyResult<Self> {
+        // PENTING: seluruh pekerjaan di bawah (baca file, dan untuk format
+        // "lain" berujung spawn proses ffprobe) itu I/O blocking. Kalau GIL
+        // gak dilepas selama ini, thread Python LAIN (termasuk main/UI
+        // thread yang jalanin event loop Qt) ikut nge-freeze selama proses
+        // ini berjalan — makanya dibungkus py.allow_threads().
+        let file_path_owned = file_path.to_string();
 
-        let mut buf = [0u8; 16];
-        file.read_exact(&mut buf)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Baca header: {}", e)))?;
+        let (duration, width, height, fps, codec): (f64, u32, u32, f64, String) =
+            py.allow_threads(|| -> PyResult<(f64, u32, u32, f64, String)> {
+                let path = Path::new(&file_path_owned);
+                let mut file = File::open(path)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
 
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                let mut buf = [0u8; 16];
+                file.read_exact(&mut buf)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Baca header: {}", e)))?;
 
-        let (duration, width, height, fps, codec): (f64, u32, u32, f64, String) = if ext == "mp4" || ext == "m4v" || ext == "mov" {
-            baca_mp4_info(&mut file)
-        } else if ext == "mkv" || ext == "webm" {
-            baca_mkv_info(&mut file)
-        } else {
-            // Untuk format lain: jalankan ffprobe DI WAKTU JALAN
-            baca_ffprobe_dinamis(file_path)
-        }?;
+                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+                if ext == "mp4" || ext == "m4v" || ext == "mov" {
+                    baca_mp4_info(&mut file)
+                } else if ext == "mkv" || ext == "webm" {
+                    // Parser native MKV/WebM belum ada -> fallback ke ffprobe,
+                    // sama seperti cabang format lain (dulu ini selalu Err
+                    // dan gak pernah fallback -- itu bug-nya).
+                    baca_mkv_info(&mut file).or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
+                } else {
+                    // ffprobe DI WAKTU JALAN — proses eksternal, blocking penuh.
+                    baca_ffprobe_dinamis(&file_path_owned)
+                }
+            })?;
 
         Ok(VideoInfo {
             path: file_path.to_string(),
@@ -74,8 +87,8 @@ struct VideoFrameReader {
 #[pymethods]
 impl VideoFrameReader {
     #[new]
-    fn new(file_path: &str) -> PyResult<Self> {
-        let info = VideoInfo::new(file_path)?;
+    fn new(py: Python<'_>, file_path: &str) -> PyResult<Self> {
+        let info = VideoInfo::new(py, file_path)?;
         Ok(VideoFrameReader {
             path: file_path.to_string(),
             duration: info.duration,
@@ -85,21 +98,30 @@ impl VideoFrameReader {
     }
 
     /// Lompat ke detik tertentu → kembalikan bingkai
-    fn seek_and_read(&mut self, second: f64) -> PyResult<Py<PyArray3<u8>>> {
+    fn seek_and_read(&mut self, py: Python<'_>, second: f64) -> PyResult<Py<PyArray3<u8>>> {
         use std::process::Command;
 
-        let output = Command::new("ffmpeg")
-            .args(&[
-                "-ss", &format!("{}", second),
-                "-i", &self.path,
-                "-vframes", "1",
-                "-f", "rawvideo",
-                "-pix_fmt", "rgb24",
-                "-v", "quiet",
-                "-"
-            ])
-            .output()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("FFmpeg gagal: {}", e)))?;
+        let path_owned = self.path.clone();
+        let second_owned = second;
+
+        // py.allow_threads: lepas GIL selama nunggu proses ffmpeg selesai.
+        // Tanpa ini, thread lain (termasuk main/UI thread Qt) ikut ke-block
+        // selama ffmpeg jalan — inilah penyebab aplikasi "Not Responding"
+        // saat hover seekbar / load thumbnail playlist.
+        let output = py.allow_threads(|| {
+            Command::new("ffmpeg")
+                .args(&[
+                    "-ss", &format!("{}", second_owned),
+                    "-i", &path_owned,
+                    "-vframes", "1",
+                    "-f", "rawvideo",
+                    "-pix_fmt", "rgb24",
+                    "-v", "quiet",
+                    "-"
+                ])
+                .output()
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("FFmpeg gagal: {}", e)))?;
 
         if !output.status.success() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -123,10 +145,8 @@ impl VideoFrameReader {
         )
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Shape gagal: {}", e)))?;
 
-        Python::with_gil(|py| {
-            let py_arr: Py<PyArray3<u8>> = arr.into_pyarray_bound(py).into();
-            Ok(py_arr)
-        })
+        let py_arr: Py<PyArray3<u8>> = arr.into_pyarray_bound(py).into();
+        Ok(py_arr)
     }
 }
 
@@ -196,8 +216,12 @@ fn baca_mp4_info(file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
 // ═══════════════════════════════════════════════
 
 fn baca_mkv_info(_file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
-    // Sementara fallback ke ffprobe untuk mkv
-    Err(pyo3::exceptions::PyValueError::new_err("Gunakan ffprobe untuk MKU"))
+    // Parsing native MKV/WebM (EBML) belum diimplementasi — daripada selalu
+    // gagal (perilaku lama), fallback ke ffprobe seperti cabang "format lain".
+    // Dipanggil dari dalam py.allow_threads() di VideoInfo::new, jadi aman.
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "MKV/WebM: pakai ffprobe (belum ada parser native)"
+    ))
 }
 
 // ═══════════════════════════════════════════════
