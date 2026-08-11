@@ -5,8 +5,9 @@ edition = "2021"
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
-ffmpeg-next = "7.0"
 numpy = "0.22"
+mp4 = "0.13.0"
+matroska = "0.6.0"
 
 [profile.release]
 opt-level = 3
