@@ -12,28 +12,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pasang Rust + Tools Build
+      - name: Pasang Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Pasang Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
+      - name: 📦 Pasang FFmpeg Full + pkg-config
+        run: |
+          choco install ffmpeg -y
+          choco install pkgconfiglite -y
+          echo "FFMPEG_DIR=C:\Program Files\ffmpeg" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=C:\Program Files\ffmpeg\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "C:\Program Files\ffmpeg\bin" >> $env:GITHUB_PATH
+        shell: powershell
+
       - name: Pasang Maturin
         run: pip install maturin
 
-      - name: ⚙️ Siapkan Variabel — Hindari Deteksi FFmpeg Sistem
-        env:
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-        run: |
-          echo "FFMPEG_SYS_NEXT_USE_PKG_CONFIG=0" >> $env:GITHUB_ENV
-
-      - name: 🔨 Kompilasi (FFmpeg statis dari sumber)
-        env:
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
+      - name: 🔨 Kompilasi
         run: maturin build --release --out dist
 
       - name: 📋 Lihat Hasil
