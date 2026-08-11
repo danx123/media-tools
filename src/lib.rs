@@ -124,7 +124,7 @@ impl VideoFrameReader {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Shape gagal: {}", e)))?;
 
         Python::with_gil(|py| {
-            let py_arr: Py<PyArray3<u8>> = arr.into_pyarray(py).into();
+            let py_arr: Py<PyArray3<u8>> = arr.into_pyarray_bound(py).into();
             Ok(py_arr)
         })
     }
