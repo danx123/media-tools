@@ -20,15 +20,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: 📦 Pasang FFmpeg Full + pkg-config
-        run: |
-          choco install ffmpeg -y
-          choco install pkgconfiglite -y
-          echo "FFMPEG_DIR=C:\Program Files\ffmpeg" >> $env:GITHUB_ENV
-          echo "PKG_CONFIG_PATH=C:\Program Files\ffmpeg\lib\pkgconfig" >> $env:GITHUB_ENV
-          echo "C:\Program Files\ffmpeg\bin" >> $env:GITHUB_PATH
-        shell: powershell
-
       - name: Pasang Maturin
         run: pip install maturin
 
