@@ -198,7 +198,14 @@ fn baca_mp4_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
 // yg juga udah ada di Cargo.toml tapi gak kepake.
 
 fn baca_mkv_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
-    let mkv = matroska::open(path_str)
+    // Di matroska 0.6.0 belum ada fungsi bebas `matroska::open()` (itu baru
+    // ditambahin di versi lebih baru) -- yang tersedia adalah method
+    // `Matroska::open()` yang nerima apa aja yang implement Read + Seek.
+    let f = File::open(path_str)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
+    let reader = BufReader::new(f);
+
+    let mkv = matroska::Matroska::open(reader)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Parse MKV/WebM gagal: {:?}", e)))?;
 
     let duration = mkv.info.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0);
