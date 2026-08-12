@@ -74,6 +74,34 @@ fn hidden_command(exe: &str) -> std::process::Command {
 // ═══════════════════════════════════════════════
 // BAGIAN 1: BACA INFORMASI VIDEO DARI HEADER
 // ═══════════════════════════════════════════════
+//
+// CATATAN REFACTOR: logic deteksi (pilih parser berdasarkan ekstensi, lalu
+// fallback ke ffprobe kalau parser header gagal) sekarang dipisah ke fungsi
+// bebas `deteksi_info_media()` supaya bisa dipakai bareng oleh `VideoInfo`
+// (dipakai di Macan Player/Viewer, butuh objek lengkap) DAN oleh
+// `get_duration_fps()` yang lebih ringan (dipakai di Macan Converter, cuma
+// butuh durasi+fps buat progress bar & ekstraksi frame, gak perlu bikin
+// objek Python).
+
+fn deteksi_info_media(file_path_owned: &str) -> PyResult<(f64, u32, u32, f64, String)> {
+    let path = Path::new(file_path_owned);
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+    if ext == "mp4" || ext == "m4v" || ext == "mov" {
+        // Kalau parser mp4 crate-nya gagal (mis. file rusak / brand
+        // aneh yg belum ke-handle), tetap coba ffprobe drpd nyerah.
+        baca_mp4_info(file_path_owned)
+            .or_else(|_| baca_ffprobe_dinamis(file_path_owned))
+    } else if ext == "mkv" || ext == "webm" {
+        baca_mkv_info(file_path_owned)
+            .or_else(|_| baca_ffprobe_dinamis(file_path_owned))
+    } else {
+        // ffprobe DI WAKTU JALAN — proses eksternal, blocking penuh.
+        // Ini juga jalur yg dipake buat format non-video (audio, gambar
+        // dikonversi, dll) yg dilempar dari Macan Converter.
+        baca_ffprobe_dinamis(file_path_owned)
+    }
+}
 
 #[pyclass]
 struct VideoInfo {
@@ -96,24 +124,8 @@ impl VideoInfo {
         // ini berjalan — makanya dibungkus py.allow_threads().
         let file_path_owned = file_path.to_string();
 
-        let (duration, width, height, fps, codec): (f64, u32, u32, f64, String) =
-            py.allow_threads(|| -> PyResult<(f64, u32, u32, f64, String)> {
-                let path = Path::new(&file_path_owned);
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-
-                if ext == "mp4" || ext == "m4v" || ext == "mov" {
-                    // Kalau parser mp4 crate-nya gagal (mis. file rusak / brand
-                    // aneh yg belum ke-handle), tetap coba ffprobe drpd nyerah.
-                    baca_mp4_info(&file_path_owned)
-                        .or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
-                } else if ext == "mkv" || ext == "webm" {
-                    baca_mkv_info(&file_path_owned)
-                        .or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
-                } else {
-                    // ffprobe DI WAKTU JALAN — proses eksternal, blocking penuh.
-                    baca_ffprobe_dinamis(&file_path_owned)
-                }
-            })?;
+        let (duration, width, height, fps, codec) =
+            py.allow_threads(|| deteksi_info_media(&file_path_owned))?;
 
         Ok(VideoInfo {
             path: file_path.to_string(),
@@ -131,6 +143,23 @@ impl VideoInfo {
             self.duration, self.width, self.height, self.fps, self.codec
         )
     }
+}
+
+/// [BARU — buat Macan Converter] Versi ringan `VideoInfo` yg cuma balikin
+/// `(duration, fps)` tanpa bikin objek Python. Ini gantiin `get_media_info()`
+/// versi Python di macan_converter56.py yang sebelumnya spawn `ffmpeg -i`
+/// lewat QProcess lalu regex-parsing teks stderr-nya (`_FFMPEG_DURATION_RE`
+/// / `_FFMPEG_FPS_RE`) -- rapuh kalau format output ffmpeg beda versi, dan
+/// selalu spawn proses baru meskipun file mp4/mkv sebenernya bisa dibaca
+/// langsung dari header tanpa proses eksternal sama sekali.
+/// GIL dilepas selama proses (sama kayak VideoInfo) supaya UI thread Qt
+/// converter gak ikut nge-freeze pas probing file gede / network drive.
+#[pyfunction]
+fn get_duration_fps(py: Python<'_>, file_path: &str) -> PyResult<(f64, f64)> {
+    let file_path_owned = file_path.to_string();
+    let (duration, _width, _height, fps, _codec) =
+        py.allow_threads(|| deteksi_info_media(&file_path_owned))?;
+    Ok((duration, fps))
 }
 
 // ═══════════════════════════════════════════════
@@ -207,6 +236,70 @@ impl VideoFrameReader {
         let py_arr: Py<PyArray3<u8>> = arr.into_pyarray_bound(py).into();
         Ok(py_arr)
     }
+}
+
+/// [BARU — buat Macan Converter] Ambil satu frame video, encode langsung
+/// jadi file gambar (mis. JPEG) lewat ffmpeg CLI -- dipakai buat thumbnail
+/// grid converter (`_get_video_thumbnail_pil_fallback` sebelumnya).
+///
+/// Beda sama `VideoFrameReader.seek_and_read` (yang balikin rawvideo mentah
+/// ke numpy array, perlu OpenCV/NumPy buat decode ulang), fungsi ini biarin
+/// ffmpeg sendiri yang encode ke file tujuan -- jadi jalur PIL fallback
+/// converter (buat CPU lawas tanpa AVX/AVX2) gak perlu decode rawvideo sama
+/// sekali, cukup buka file JPEG hasilnya.
+///
+/// Strategi sama persis kayak versi Python lama: coba ambil frame di detik
+/// `second` dulu (default 1.0, lebih representatif drpd frame hitam di
+/// detik 0), kalau gagal/file kosong (video lebih pendek dari `second`)
+/// fallback ke frame pertama (detik 0). `hidden_command`/`resolve_exe` di
+/// sini otomatis nyari ffmpeg lewat `set_ffmpeg_dir()` kalau udah di-set,
+/// jadi converter gak perlu lagi punya pencarian ffmpeg sendiri
+/// (`_find_ffmpeg_path_global`) buat titik ini.
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, second=1.0))]
+fn extract_thumbnail_frame(
+    py: Python<'_>,
+    input_path: &str,
+    output_path: &str,
+    second: f64,
+) -> PyResult<bool> {
+    let input_owned = input_path.to_string();
+    let output_owned = output_path.to_string();
+
+    let berhasil = py.allow_threads(|| -> bool {
+        let coba_di_detik = |ss: f64| -> bool {
+            let hasil = hidden_command(&resolve_exe("ffmpeg"))
+                .args(&[
+                    "-y",
+                    "-ss", &format!("{}", ss),
+                    "-i", &input_owned,
+                    "-frames:v", "1",
+                    "-q:v", "3",
+                    &output_owned,
+                ])
+                .output();
+
+            match hasil {
+                Ok(out) if out.status.success() => {
+                    // ffmpeg bisa aja exit 0 tapi gak nulis apa-apa (mis.
+                    // timestamp di luar durasi) -- cek file beneran ada isi.
+                    Path::new(&output_owned)
+                        .metadata()
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        };
+
+        if coba_di_detik(second) {
+            return true;
+        }
+        // Fallback: video lebih pendek dari `second` -- ambil frame pertama.
+        coba_di_detik(0.0)
+    });
+
+    Ok(berhasil)
 }
 
 // ═══════════════════════════════════════════════
@@ -353,5 +446,7 @@ fn media_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VideoInfo>()?;
     m.add_class::<VideoFrameReader>()?;
     m.add_function(wrap_pyfunction!(set_ffmpeg_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(get_duration_fps, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_thumbnail_frame, m)?)?;
     Ok(())
 }
