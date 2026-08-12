@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use numpy::{PyArray3, IntoPyArray, ndarray::Array3};
 use std::path::Path;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::BufReader;
 
 // ═══════════════════════════════════════════════
 // BAGIAN 1: BACA INFORMASI VIDEO DARI HEADER
@@ -32,22 +32,16 @@ impl VideoInfo {
         let (duration, width, height, fps, codec): (f64, u32, u32, f64, String) =
             py.allow_threads(|| -> PyResult<(f64, u32, u32, f64, String)> {
                 let path = Path::new(&file_path_owned);
-                let mut file = File::open(path)
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
-
-                let mut buf = [0u8; 16];
-                file.read_exact(&mut buf)
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Baca header: {}", e)))?;
-
                 let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
                 if ext == "mp4" || ext == "m4v" || ext == "mov" {
-                    baca_mp4_info(&mut file)
+                    // Kalau parser mp4 crate-nya gagal (mis. file rusak / brand
+                    // aneh yg belum ke-handle), tetap coba ffprobe drpd nyerah.
+                    baca_mp4_info(&file_path_owned)
+                        .or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
                 } else if ext == "mkv" || ext == "webm" {
-                    // Parser native MKV/WebM belum ada -> fallback ke ffprobe,
-                    // sama seperti cabang format lain (dulu ini selalu Err
-                    // dan gak pernah fallback -- itu bug-nya).
-                    baca_mkv_info(&mut file).or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
+                    baca_mkv_info(&file_path_owned)
+                        .or_else(|_| baca_ffprobe_dinamis(&file_path_owned))
                 } else {
                     // ffprobe DI WAKTU JALAN — proses eksternal, blocking penuh.
                     baca_ffprobe_dinamis(&file_path_owned)
@@ -151,77 +145,83 @@ impl VideoFrameReader {
 }
 
 // ═══════════════════════════════════════════════
-// FUNGSI BANTU: BACA HEADER MP4
+// FUNGSI BANTU: BACA HEADER MP4 (pakai crate `mp4`, bukan parser manual)
 // ═══════════════════════════════════════════════
+//
+// CATATAN: versi sebelumnya parsing box MP4 (moov/mvhd/avc1/dst) manual
+// byte-per-byte, dan ada bug alignment di box `mvhd` (skip byte yg salah)
+// yg bikin semua box SESUDAHNYA (termasuk avc1/hev1 yg nyimpen width/
+// height) ke-parse dari offset yg salah -> width/height sering kebaca 0
+// tanpa error apapun. Makanya thumbnail nongol sebagai gambar 0x0 (kosong)
+// alih-alih fallback ke OpenCV. Cargo.toml sebenarnya udah nyantumin
+// `mp4 = "0.13.0"` sebagai dependency tapi gak pernah dipakai -- sekarang
+// dipakai beneran di sini.
 
-fn baca_mp4_info(file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut buf = [0u8; 8];
+fn baca_mp4_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
+    let f = File::open(path_str)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
+    let size = f.metadata()
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Metadata file: {}", e)))?
+        .len();
+    let reader = BufReader::new(f);
 
-    let mut timescale = 1000;
-    let mut duration = 0u64;
-    let mut width = 0u32;
-    let mut height = 0u32;
-    let mut codec = "MP4".to_string();
+    let mp4 = mp4::Mp4Reader::read_header(reader, size)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Parse MP4 gagal: {}", e)))?;
 
-    loop {
-        if file.read(&mut buf).is_err() || buf == [0; 8] { break; }
-        let size = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as u64;
-        let kind = &buf[4..8];
+    let duration = mp4.duration().as_secs_f64();
 
-        if size == 0 || size > 100_000_000 { break; }
-
-        match kind {
-            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"stsd" => {
-                // Masuk ke kotak ini — baca isinya
-            }
-            b"mvhd" => {
-                let mut v = [0u8; 1];
-                file.read_exact(&mut v)?;
-                let _version = v[0];
-                file.seek(SeekFrom::Current(12))?; // lewati waktu pembuatan dll
-                let mut ts_buf = [0u8; 4];
-                file.read_exact(&mut ts_buf)?;
-                timescale = u32::from_be_bytes(ts_buf);
-                let mut dur_buf = [0u8; 4];
-                file.read_exact(&mut dur_buf)?;
-                duration = u32::from_be_bytes(dur_buf) as u64;
-                continue;
-            }
-            b"avc1" | b"mp4v" | b"hev1" | b"hvc1" | b"vp09" => {
-                file.seek(SeekFrom::Current(78))?;
-                let mut w_buf = [0u8; 2];
-                file.read_exact(&mut w_buf)?;
-                width = u16::from_be_bytes(w_buf) as u32;
-                let mut h_buf = [0u8; 2];
-                file.read_exact(&mut h_buf)?;
-                height = u16::from_be_bytes(h_buf) as u32;
-                codec = String::from_utf8_lossy(kind).to_string();
-                continue;
-            }
-            _ => {}
-        }
-
-        if size > 8 {
-            file.seek(SeekFrom::Current((size - 8) as i64))?;
+    // Cari track video pertama.
+    for track in mp4.tracks().values() {
+        if track.track_type().map(|t| t == mp4::TrackType::Video).unwrap_or(false) {
+            let width  = track.width() as u32;
+            let height = track.height() as u32;
+            let fps    = track.frame_rate();
+            let codec  = track
+                .media_type()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|_| "Unknown".to_string());
+            return Ok((duration, width, height, fps, codec));
         }
     }
 
-    let dur_sec = if timescale > 0 { duration as f64 / timescale as f64 } else { 0.0 };
-    Ok((dur_sec, width, height, 0.0, codec))
+    // Gak ada track video (mis. file audio-only) -- tetap kembalikan durasi.
+    Ok((duration, 0, 0, 0.0, "Unknown".to_string()))
 }
 
 // ═══════════════════════════════════════════════
-// FUNGSI BANTU: BACA MKV/WEBM
+// FUNGSI BANTU: BACA MKV/WEBM (pakai crate `matroska`)
 // ═══════════════════════════════════════════════
+//
+// Sebelumnya fungsi ini SELALU return Err tanpa pernah nyoba parsing apapun
+// (dan VideoInfo::new gak fallback ke ffprobe kalau ini gagal) -- itu bug
+// yg dilaporkan sebelumnya. Sekarang beneran parsing pakai crate `matroska`
+// yg juga udah ada di Cargo.toml tapi gak kepake.
 
-fn baca_mkv_info(_file: &mut File) -> PyResult<(f64, u32, u32, f64, String)> {
-    // Parsing native MKV/WebM (EBML) belum diimplementasi — daripada selalu
-    // gagal (perilaku lama), fallback ke ffprobe seperti cabang "format lain".
-    // Dipanggil dari dalam py.allow_threads() di VideoInfo::new, jadi aman.
-    Err(pyo3::exceptions::PyValueError::new_err(
-        "MKV/WebM: pakai ffprobe (belum ada parser native)"
-    ))
+fn baca_mkv_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
+    let mkv = matroska::open(path_str)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Parse MKV/WebM gagal: {:?}", e)))?;
+
+    let duration = mkv.info.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+
+    for track in mkv.tracks.iter() {
+        if track.tracktype == matroska::Tracktype::Video {
+            let (width, height) = match &track.settings {
+                matroska::Settings::Video(v) => (v.pixel_width as u32, v.pixel_height as u32),
+                _ => (0, 0),
+            };
+            // matroska crate gak ngasih fps langsung -- biarin 0.0, nanti
+            // dilengkapi via OpenCV di sisi Python (lihat _PropertiesMetaWorker
+            // / ThumbnailGenerator, keduanya udah handle fps<=0 sbg "belum lengkap").
+            let codec = if track.codec_id.is_empty() {
+                "Unknown".to_string()
+            } else {
+                track.codec_id.clone()
+            };
+            return Ok((duration, width, height, 0.0, codec));
+        }
+    }
+
+    Ok((duration, 0, 0, 0.0, "Unknown".to_string()))
 }
 
 // ═══════════════════════════════════════════════
