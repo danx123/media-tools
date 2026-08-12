@@ -3,6 +3,57 @@ use numpy::{PyArray3, IntoPyArray, ndarray::Array3};
 use std::path::Path;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::OnceLock;
+use std::sync::Mutex;
+
+// ═══════════════════════════════════════════════
+// LOKASI BINARY ffmpeg/ffprobe (bukan cuma andelin PATH)
+// ═══════════════════════════════════════════════
+//
+// std::process::Command::new("ffmpeg") cuma nyari lewat mekanisme pencarian
+// OS (di Windows: folder app yg lagi jalan -> CWD -> system dirs -> PATH).
+// Kalau ffmpeg.exe ditaro di folder root project (bukan di PATH sistem,
+// bukan juga sefolder sama python.exe), itu gak bakal ketemu -- makanya
+// perlu Python ngasih tau lewat set_ffmpeg_dir() di mana folder itu.
+
+static FFMPEG_DIR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn ffmpeg_dir_cell() -> &'static Mutex<Option<String>> {
+    FFMPEG_DIR.get_or_init(|| Mutex::new(None))
+}
+
+/// Dipanggil dari Python sekali di awal (mis. tepat setelah `import
+/// media_tools`) buat ngasih tau folder tempat ffmpeg.exe/ffprobe.exe
+/// ditaro, kalau itu bukan folder yg otomatis ke-scan OS.
+#[pyfunction]
+fn set_ffmpeg_dir(dir: &str) -> PyResult<()> {
+    let mut guard = ffmpeg_dir_cell()
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Lock ffmpeg_dir gagal"))?;
+    *guard = Some(dir.to_string());
+    Ok(())
+}
+
+/// Cari path lengkap ke `exe_name` (mis. "ffmpeg"/"ffprobe", tanpa
+/// ekstensi). Urutan: 1) folder yg di-set lewat set_ffmpeg_dir() -- coba
+/// dengan & tanpa ".exe", 2) fallback ke nama polos supaya OS yg nyari
+/// lewat PATH seperti biasa.
+fn resolve_exe(exe_name: &str) -> String {
+    if let Ok(guard) = ffmpeg_dir_cell().lock() {
+        if let Some(dir) = guard.as_ref() {
+            let base = Path::new(dir);
+            let with_ext = base.join(format!("{}.exe", exe_name));
+            if with_ext.is_file() {
+                return with_ext.to_string_lossy().to_string();
+            }
+            let no_ext = base.join(exe_name);
+            if no_ext.is_file() {
+                return no_ext.to_string_lossy().to_string();
+            }
+        }
+    }
+    exe_name.to_string()
+}
 
 // ═══════════════════════════════════════════════
 // BAGIAN 1: BACA INFORMASI VIDEO DARI HEADER
@@ -103,7 +154,7 @@ impl VideoFrameReader {
         // selama ffmpeg jalan — inilah penyebab aplikasi "Not Responding"
         // saat hover seekbar / load thumbnail playlist.
         let output = py.allow_threads(|| {
-            Command::new("ffmpeg")
+            Command::new(resolve_exe("ffmpeg"))
                 .args(&[
                     "-ss", &format!("{}", second_owned),
                     "-i", &path_owned,
@@ -237,7 +288,7 @@ fn baca_mkv_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
 fn baca_ffprobe_dinamis(path: &str) -> PyResult<(f64, u32, u32, f64, String)> {
     use std::process::Command;
 
-    let output = Command::new("ffprobe")
+    let output = Command::new(resolve_exe("ffprobe"))
         .args(&[
             "-v", "quiet",
             "-select_streams", "v:0",
@@ -289,5 +340,6 @@ fn baca_ffprobe_dinamis(path: &str) -> PyResult<(f64, u32, u32, f64, String)> {
 fn media_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VideoInfo>()?;
     m.add_class::<VideoFrameReader>()?;
+    m.add_function(wrap_pyfunction!(set_ffmpeg_dir, m)?)?;
     Ok(())
 }
