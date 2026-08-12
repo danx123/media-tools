@@ -55,6 +55,22 @@ fn resolve_exe(exe_name: &str) -> String {
     exe_name.to_string()
 }
 
+/// Bikin std::process::Command yang gak nampilin console window sekilas di
+/// Windows (flash hitam yang keliatan tiap ffmpeg/ffprobe di-spawn, apalagi
+/// kentara banget di build Nuitka/PyInstaller standalone). CREATE_NO_WINDOW
+/// (0x08000000) cuma valid di Windows, jadi di-cfg-in supaya tetep compile
+/// normal di platform lain.
+fn hidden_command(exe: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 // ═══════════════════════════════════════════════
 // BAGIAN 1: BACA INFORMASI VIDEO DARI HEADER
 // ═══════════════════════════════════════════════
@@ -144,8 +160,6 @@ impl VideoFrameReader {
 
     /// Lompat ke detik tertentu → kembalikan bingkai
     fn seek_and_read(&mut self, py: Python<'_>, second: f64) -> PyResult<Py<PyArray3<u8>>> {
-        use std::process::Command;
-
         let path_owned = self.path.clone();
         let second_owned = second;
 
@@ -154,7 +168,7 @@ impl VideoFrameReader {
         // selama ffmpeg jalan — inilah penyebab aplikasi "Not Responding"
         // saat hover seekbar / load thumbnail playlist.
         let output = py.allow_threads(|| {
-            Command::new(resolve_exe("ffmpeg"))
+            hidden_command(&resolve_exe("ffmpeg"))
                 .args(&[
                     "-ss", &format!("{}", second_owned),
                     "-i", &path_owned,
@@ -286,9 +300,7 @@ fn baca_mkv_info(path_str: &str) -> PyResult<(f64, u32, u32, f64, String)> {
 // ═══════════════════════════════════════════════
 
 fn baca_ffprobe_dinamis(path: &str) -> PyResult<(f64, u32, u32, f64, String)> {
-    use std::process::Command;
-
-    let output = Command::new(resolve_exe("ffprobe"))
+    let output = hidden_command(&resolve_exe("ffprobe"))
         .args(&[
             "-v", "quiet",
             "-select_streams", "v:0",
