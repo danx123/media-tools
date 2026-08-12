@@ -1,10 +1,15 @@
 [package]
 name = "media_tools"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# abi3-py310: build SEKALI, wheel-nya jalan di Python 3.10, 3.11, 3.12, 3.13,
+# dst tanpa perlu rebuild per versi. Penting karena media_tools sekarang
+# dipakai lintas app (player/viewer + macan_converter), dan tiap app belum
+# tentu di-bundle sama versi Python yang sama pas di-Nuitka-in -- sebelum ini
+# tiap kombinasi python minor version butuh wheel-nya sendiri.
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 numpy = "0.22"
 mp4 = "0.13.0"
 matroska = "0.6.0"
