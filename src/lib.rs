@@ -303,6 +303,104 @@ fn extract_thumbnail_frame(
 }
 
 // ═══════════════════════════════════════════════
+// BAGIAN 3: DECODE VP9 (WebM/MKV) — PAKSA DECODER libvpx-vp9 VIA FFmpeg
+// ═══════════════════════════════════════════════
+//
+// `VideoFrameReader.seek_and_read` di atas sebenarnya udah "codec-agnostic"
+// -- dia cuma manggil `ffmpeg -i ...` polos, dan ffmpeg sendiri yg milih
+// decoder lewat auto-probe berdasarkan isi file. Buat sebagian besar file
+// VP9 itu udah cukup. Tapi ada 2 kasus yg bikin auto-probe meleset/lambat:
+//
+//   1. File .webm yg gak nyimpen codec tag standar dg bener (mis. hasil
+//      remux/edit tool tertentu) -- ffmpeg bisa salah nebak decoder atau
+//      nyoba hwaccel dulu sebelum jatuh ke software.
+//   2. Sebagian build ffmpeg custom/portable (yg dibundle bareng app ini,
+//      lihat set_ffmpeg_dir()) punya urutan auto-probe decoder VP9 yg beda
+//      dari build ffmpeg "resmi" -- hasilnya gak konsisten antar-mesin user.
+//
+// `decode_vp9_frame()` di bawah paksa `-c:v libvpx-vp9` sebagai INPUT
+// decoder option (harus SEBELUM `-i`, itu yg bikin dia jadi decoder option
+// bukan encoder option) supaya ffmpeg gak perlu nebak sama sekali. Dipanggil
+// dari Python sbg fallback kedua (sesudah seek_and_read generic gagal) utk
+// file yg terdeteksi VP9, sebelum jatuh ke OpenCV -- lihat is_vp9_codec()
+// juga di bawah buat bantu Python mutusin kapan jalur ini relevan.
+
+#[pyfunction]
+#[pyo3(signature = (file_path, second=0.0))]
+fn decode_vp9_frame(py: Python<'_>, file_path: &str, second: f64) -> PyResult<Py<PyArray3<u8>>> {
+    // Butuh width/height duluan buat reshape rawvideo output ffmpeg jadi
+    // array (rawvideo gak nyimpen dimensi di stream-nya sendiri) -- pakai
+    // deteksi_info_media yg udah ada (header mkv/webm via crate `matroska`,
+    // fallback ffprobe kalau parser header gagal/format aneh).
+    let file_path_owned = file_path.to_string();
+    let (_duration, width, height, _fps, _codec) =
+        py.allow_threads(|| deteksi_info_media(&file_path_owned))?;
+
+    if width == 0 || height == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Gak bisa baca resolusi video (width/height = 0), gagal decode VP9".to_string(),
+        ));
+    }
+
+    let path_owned = file_path.to_string();
+    let output = py.allow_threads(|| {
+        hidden_command(&resolve_exe("ffmpeg"))
+            .args(&[
+                // -c:v SEBELUM -i = paksa decoder input, bukan encoder.
+                "-c:v", "libvpx-vp9",
+                "-ss", &format!("{}", second),
+                "-i", &path_owned,
+                "-vframes", "1",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-v", "quiet",
+                "-",
+            ])
+            .output()
+    })
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("FFmpeg gagal dijalankan: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "FFmpeg gagal decode VP9: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let data = output.stdout;
+    let total_pixels = width as usize * height as usize;
+    let expected_len = total_pixels * 3;
+
+    if data.len() < expected_len {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Data VP9 tidak cukup: {} < {}",
+            data.len(),
+            expected_len
+        )));
+    }
+
+    let arr = Array3::from_shape_vec(
+        (height as usize, width as usize, 3),
+        data[0..expected_len].to_vec(),
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Shape gagal: {}", e)))?;
+
+    Ok(arr.into_pyarray_bound(py).into())
+}
+
+/// Helper kecil buat sisi Python: cek apakah string codec yg dikembalikan
+/// `VideoInfo.codec` / `deteksi_info_media` itu VP9. Perlu ini krn tiap
+/// jalur parser ngasih nama beda-beda: crate `matroska` balikin raw
+/// `codec_id` Matroska (mis. "V_VP9"), sedangkan ffprobe balikin nama
+/// ffmpeg biasa (mis. "vp9") dan kadang container nyimpen sbg "vp09"
+/// (fourcc-style, umum di beberapa muxer mp4-in-webm hybrid).
+#[pyfunction]
+fn is_vp9_codec(codec: &str) -> bool {
+    let c = codec.to_lowercase();
+    c == "v_vp9" || c == "vp9" || c == "vp09" || c.contains("vp9")
+}
+
+// ═══════════════════════════════════════════════
 // FUNGSI BANTU: BACA HEADER MP4 (pakai crate `mp4`, bukan parser manual)
 // ═══════════════════════════════════════════════
 //
@@ -448,5 +546,7 @@ fn media_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_ffmpeg_dir, m)?)?;
     m.add_function(wrap_pyfunction!(get_duration_fps, m)?)?;
     m.add_function(wrap_pyfunction!(extract_thumbnail_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_vp9_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(is_vp9_codec, m)?)?;
     Ok(())
 }
