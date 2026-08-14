@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
-use numpy::{PyArray3, IntoPyArray, ndarray::Array3};
+use numpy::{PyArray1, PyArray3, PyReadonlyArray1, IntoPyArray, ndarray::Array3};
+use rayon::prelude::*;
 use std::path::Path;
 use std::fs::File;
 use std::io::BufReader;
@@ -401,6 +402,184 @@ fn is_vp9_codec(codec: &str) -> bool {
 }
 
 // ═══════════════════════════════════════════════
+// BAGIAN 3: AUDIO — WAVEFORM ENVELOPE & DETEKSI BPM
+// ═══════════════════════════════════════════════
+//
+// CATATAN: dua fungsi di bawah ini GAK spawn proses ffmpeg apapun --
+// decode PCM (ffmpeg -f f32le) tetep dilakuin di sisi Python kayak
+// sebelumnya (audio_cutter.py / advanced_tag_editorv85.py, fungsi
+// `_ffmpeg_decode_pcm`, gak diubah). Yang dipindah ke Rust cuma bagian
+// CPU-bound SETELAH decode -- ini yg bikin lag di kedua app:
+//   1. `_precompute_pixels()` (audio_cutter.py) & downsample+RMS loop di
+//      `_WaveformLoadThread` (advanced_tag_editorv85.py): for-loop Python
+//      murni, N~4000 iterasi tiap load file, overhead interpreter per-
+//      iterasi (bukan compute-nya) yg dominan.
+//   2. `_detect_bpm_numpy()`: list-comprehension Python buat energy array
+//      (ribuan frame) + `np.correlate(mode='full')` yg ngitung SEMUA lag
+//      padahal cuma rentang 50-200 BPM yg dipake belakangan.
+// Rayon dipake buat paralelisasi chunk/lag di banyak core sekaligus.
+
+/// Precompute per-kolom min/max/RMS dari sinyal PCM mono float32, buat
+/// waveform display resolusi tetap. Chunking-nya sengaja disamain PERSIS
+/// kayak versi Python lama (`chunk = max(1, len(y) // target_cols)`,
+/// iterasi step `chunk`) biar jumlah kolom & pembagian datanya identik --
+/// cuma loop-nya yg pindah dari Python ke Rust + paralel.
+///
+/// Dipanggil dengan target_cols=4000 di audio_cutter.py
+/// `_precompute_pixels()` (pakai mins/maxs/rms langsung), dan di
+/// advanced_tag_editorv85.py `_WaveformLoadThread` (sekali dengan
+/// target_cols=4000 buat downsample tampilan -- pakai `first_sample`
+/// sbg pengganti `y[::step]` -- sekali lagi dengan target_cols=200
+/// dipanggil di atas hasil downsample-nya buat envelope RMS).
+///
+/// Return: (mins, maxs, rms, first_sample) sbg numpy array float32.
+#[pyfunction]
+fn compute_waveform_envelope(
+    py: Python<'_>,
+    y: PyReadonlyArray1<f32>,
+    target_cols: usize,
+) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<f32>>, Py<PyArray1<f32>>, Py<PyArray1<f32>>)> {
+    let y_slice = y.as_slice()?;
+    let target_cols = target_cols.max(1);
+
+    // py.allow_threads: ini bisa makan waktu buat file panjang -- lepas
+    // GIL supaya UI thread Qt (yg minta waveform, biasanya via QThread
+    // tapi tetep) gak ikut ke-block kalau ada bagian lain yg pegang GIL.
+    let (mins, maxs, rms, first) = py.allow_threads(|| {
+        let len = y_slice.len();
+        if len == 0 {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        let chunk = (len / target_cols).max(1);
+
+        // Kumpulin batas chunk dulu (murah, cuma angka), baru diproses
+        // paralel lewat rayon -- rayon butuh iterator yg bisa displit adil,
+        // gak praktis langsung dari `step_by` di atas slice.
+        let starts: Vec<usize> = (0..len).step_by(chunk).collect();
+
+        let results: Vec<(f32, f32, f32, f32)> = starts
+            .par_iter()
+            .map(|&start| {
+                let end = (start + chunk).min(len);
+                let seg = &y_slice[start..end];
+                let mut mn = f32::INFINITY;
+                let mut mx = f32::NEG_INFINITY;
+                let mut sum_sq = 0f64;
+                for &v in seg {
+                    if v < mn { mn = v; }
+                    if v > mx { mx = v; }
+                    sum_sq += (v as f64) * (v as f64);
+                }
+                let rms_val = (sum_sq / seg.len().max(1) as f64).sqrt() as f32;
+                (mn, mx, rms_val, seg[0])
+            })
+            .collect();
+
+        let mut mins  = Vec::with_capacity(results.len());
+        let mut maxs  = Vec::with_capacity(results.len());
+        let mut rms   = Vec::with_capacity(results.len());
+        let mut first = Vec::with_capacity(results.len());
+        for (mn, mx, r, f0) in results {
+            mins.push(mn);
+            maxs.push(mx);
+            rms.push(r);
+            first.push(f0);
+        }
+        (mins, maxs, rms, first)
+    });
+
+    Ok((
+        mins.into_pyarray_bound(py).into(),
+        maxs.into_pyarray_bound(py).into(),
+        rms.into_pyarray_bound(py).into(),
+        first.into_pyarray_bound(py).into(),
+    ))
+}
+
+/// Estimasi BPM dari sinyal PCM mono float32 via energy-autocorrelation --
+/// port 1:1 dari `_detect_bpm_numpy()` (sama-sama ada di audio_cutter.py
+/// dan advanced_tag_editorv85.py), cuma pindah ke Rust + paralel lewat
+/// rayon. Rentang pencarian tetap 50-200 BPM sama kayak versi Python,
+/// jadi hasil deteksinya harusnya identik -- cuma jauh lebih cepat buat
+/// file/durasi panjang.
+///
+/// Balikin 0.0 kalau BPM gak bisa ditentukan (audio kependekan / sr
+/// gak masuk akal) -- sisi Python tinggal cek `bpm <= 0` sbg tanda gagal
+/// kayak sebelumnya, gak perlu ubah logic caller-nya.
+#[pyfunction]
+fn detect_bpm(py: Python<'_>, y: PyReadonlyArray1<f32>, sr: u32) -> PyResult<f64> {
+    let y_slice = y.as_slice()?;
+    let sr_f = sr as f64;
+
+    let bpm = py.allow_threads(|| -> f64 {
+        if sr_f <= 0.0 {
+            return 0.0;
+        }
+        let hop = (sr_f * 0.01) as usize;   // 10ms per frame
+        let win = (sr_f * 0.025) as usize;  // 25ms window per frame
+        if hop == 0 || win == 0 || y_slice.len() <= win {
+            return 0.0;
+        }
+        let n_frames = (y_slice.len() - win) / hop;
+        if n_frames < 2 {
+            return 0.0;
+        }
+
+        // Energy envelope per frame (short-time energy) -- ini yg
+        // sebelumnya list-comprehension Python, sekarang paralel per frame.
+        let mut energy: Vec<f64> = (0..n_frames)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * hop;
+                let seg = &y_slice[start..(start + win).min(y_slice.len())];
+                seg.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
+            })
+            .collect();
+
+        let mean: f64 = energy.iter().sum::<f64>() / n_frames as f64;
+        for e in energy.iter_mut() {
+            *e -= mean;
+        }
+
+        let fps = sr_f / hop as f64;
+        let mut min_lag = (fps * 60.0 / 200.0) as usize;
+        let mut max_lag = (fps * 60.0 / 50.0) as usize;
+        min_lag = min_lag.max(1);
+        max_lag = max_lag.min(n_frames.saturating_sub(1));
+        if min_lag >= max_lag {
+            return 0.0;
+        }
+
+        // Autocorrelation, tapi CUMA di rentang lag yg relevan (50-200
+        // BPM) -- versi Python ngitung SEMUA lag lewat np.correlate
+        // mode='full' (jauh lebih banyak kerjaan) baru diiris belakangan.
+        let energy_ref = &energy;
+        let best_lag = (min_lag..max_lag)
+            .into_par_iter()
+            .map(|lag| {
+                let mut c = 0f64;
+                for i in 0..(n_frames - lag) {
+                    c += energy_ref[i] * energy_ref[i + lag];
+                }
+                (lag, c)
+            })
+            .reduce(
+                || (min_lag, f64::MIN),
+                |a, b| if b.1 > a.1 { b } else { a },
+            )
+            .0;
+
+        if best_lag == 0 {
+            return 0.0;
+        }
+        let bpm = fps * 60.0 / best_lag as f64;
+        (bpm * 10.0).round() / 10.0
+    });
+
+    Ok(bpm)
+}
+
+// ═══════════════════════════════════════════════
 // FUNGSI BANTU: BACA HEADER MP4 (pakai crate `mp4`, bukan parser manual)
 // ═══════════════════════════════════════════════
 //
@@ -548,5 +727,7 @@ fn media_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_thumbnail_frame, m)?)?;
     m.add_function(wrap_pyfunction!(decode_vp9_frame, m)?)?;
     m.add_function(wrap_pyfunction!(is_vp9_codec, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_waveform_envelope, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_bpm, m)?)?;
     Ok(())
 }
