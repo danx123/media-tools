@@ -1,6 +1,6 @@
 [package]
 name = "media_tools"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,17 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 numpy = "0.22"
 mp4 = "0.13.0"
 matroska = "0.6.0"
+# rayon: paralelisasi compute_waveform_envelope() & detect_bpm() (lib.rs)
+# di banyak core CPU. Pure-Rust, gak butuh link ke lib sistem apapun,
+# jadi aman dipakai di build Windows CI ini (beda kasus sama ffmpeg/
+# libvpx yg sengaja dihindari -- lihat catatan decode_vp9_frame di bawah).
+rayon = "1"
+# CATATAN: decode_vp9_frame() di lib.rs GAK butuh crate ffmpeg/libvpx Rust
+# (mis. `ffmpeg-next` / `ffmpeg-sys-next`) -- itu sengaja dihindari krn bakal
+# butuh link statis/dinamis ke libav*/libvpx pas build (ribet & rapuh di CI
+# Windows). Sama kayak fungsi frame-grab lain, VP9 decode tetep lewat spawn
+# proses `ffmpeg.exe` eksternal (dicari via set_ffmpeg_dir()/resolve_exe()),
+# cuma dipaksa pakai decoder "-c:v libvpx-vp9" biar gak salah auto-probe.
 
 [profile.release]
 opt-level = 3
